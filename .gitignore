@@ -1,0 +1,17 @@
+# Generated extraction/render output
+output/
+
+# PDFs are large, local test inputs
+test_pdfs/*.pdf
+
+# Python venv & caches
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+.claude/
