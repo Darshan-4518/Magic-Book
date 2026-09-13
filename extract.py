@@ -1,4 +1,8 @@
-"""Extract PDFs in ./test_pdfs/ to normalized JSON in ./output/<name>.json using Docling."""
+"""Extract PDFs in ./test_pdfs/ to reading Markdown in ./output/<name>.md.
+
+Pipeline: Docling (layout) -> refine.py (pdfplumber cross-checks) -> md_render.py.
+By default only .md files are written; pass --full to also write the
+intermediate .json (which render.py can turn into HTML)."""
 
 from __future__ import annotations
 
@@ -26,6 +30,9 @@ from docling_core.types.doc.document import (
     TitleItem,
 )
 from docling_core.types.doc.labels import DocItemLabel
+
+from md_render import to_markdown
+from refine import refine_document
 
 ROOT = Path(__file__).parent
 IN_DIR = ROOT / "test_pdfs"
@@ -71,6 +78,19 @@ def first_page(item) -> int | None:
     if prov:
         return prov[0].page_no
     return None
+
+
+def first_bbox(item, doc) -> list[float] | None:
+    """Top-left-origin [l, t, r, b] of the item's first provenance, in PDF points."""
+    prov = getattr(item, "prov", None)
+    if not prov:
+        return None
+    p = prov[0]
+    page = doc.pages.get(p.page_no)
+    if page is None or page.size is None:
+        return None
+    bb = p.bbox.to_top_left_origin(page.size.height)
+    return [round(bb.l, 1), round(bb.t, 1), round(bb.r, 1), round(bb.b, 1)]
 
 
 def label_to_block_type(label) -> str | None:
@@ -137,6 +157,9 @@ def build_block(bid: str, item, doc) -> dict | None:
         return None
     page = first_page(item)
     block: dict = {"id": bid, "type": btype, "text": "", "html": "", "page": page}
+    bbox = first_bbox(item, doc)
+    if bbox:
+        block["bbox"] = bbox
 
     if isinstance(item, TableItem):
         rows = table_rows(item)
@@ -175,14 +198,11 @@ def build_block(bid: str, item, doc) -> dict | None:
     return block
 
 
-def extract_one(pdf_path: Path, converter: DocumentConverter) -> tuple[dict, str]:
+def extract_one(pdf_path: Path, converter: DocumentConverter) -> dict:
     t0 = time.perf_counter()
     result = converter.convert(str(pdf_path))
     doc = result.document
     elapsed = time.perf_counter() - t0
-    markdown = doc.export_to_markdown(
-        included_content_layers={ContentLayer.BODY},
-    )
 
     layers = {ContentLayer.BODY, ContentLayer.FURNITURE}
     blocks: list[dict] = []
@@ -227,15 +247,21 @@ def extract_one(pdf_path: Path, converter: DocumentConverter) -> tuple[dict, str
             title = block["text"]
         blocks.append(block)
 
+    t1 = time.perf_counter()
+    blocks, dropped, title, repairs = refine_document(blocks, dropped, pdf_path, title)
+    refine_elapsed = time.perf_counter() - t1
+
     data = {
         "title": title,
         "source_file": pdf_path.name,
         "page_count": doc.num_pages(),
         "extraction_seconds": round(elapsed, 3),
+        "refine_seconds": round(refine_elapsed, 3),
+        "repairs": repairs,
         "blocks": blocks,
         "dropped": dropped,
     }
-    return data, markdown
+    return data
 
 
 def build_converter() -> DocumentConverter:
@@ -249,7 +275,23 @@ def build_converter() -> DocumentConverter:
     )
 
 
+def print_summary(rows: list[tuple]) -> None:
+    hdr = ("file", "pages", "seconds", "s/page", "blocks", "dropped", "repairs", "errors")
+    disp = [
+        (r[0], str(r[1]), f"{r[2]:.2f}", f"{r[3]:.2f}", str(r[4]), str(r[5]), r[6], r[7] or "-")
+        for r in rows
+    ]
+    widths = [max(len(str(r[i])) for r in disp + [hdr]) for i in range(len(hdr))]
+    fmt = lambda r: " | ".join(str(r[i]).ljust(widths[i]) for i in range(len(hdr)))
+    print()
+    print(fmt(hdr))
+    print("-+-".join("-" * w for w in widths))
+    for r in disp:
+        print(fmt(r))
+
+
 def main() -> int:
+    write_full = "--full" in sys.argv
     OUT_DIR.mkdir(exist_ok=True)
     IN_DIR.mkdir(exist_ok=True)
     pdfs = sorted(IN_DIR.glob("*.pdf"))
@@ -260,27 +302,37 @@ def main() -> int:
     converter = build_converter()
     print(f"Processing {len(pdfs)} PDF(s)...", flush=True)
     exit_code = 0
+    rows: list[tuple] = []
     for pdf in pdfs:
-        out_path = OUT_DIR / f"{pdf.stem}.json"
         err_path = OUT_DIR / f"{pdf.stem}.error.txt"
         if err_path.exists():
             err_path.unlink()
         try:
-            data, markdown = extract_one(pdf, converter)
-            out_path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
-            md_path = OUT_DIR / f"{pdf.stem}.md"
-            md_path.write_text(markdown)
-            print(
-                f"  {pdf.name}: {data['page_count']}p, "
-                f"{data['extraction_seconds']}s, "
-                f"{len(data['blocks'])} blocks, {len(data['dropped'])} dropped, "
-                f"md {len(markdown):,} chars",
-                flush=True,
+            data = extract_one(pdf, converter)
+            (OUT_DIR / f"{pdf.stem}.md").write_text(to_markdown(data))
+            if write_full:
+                (OUT_DIR / f"{pdf.stem}.json").write_text(
+                    json.dumps(data, indent=2, ensure_ascii=False)
+                )
+            rep = data["repairs"]
+            rep_str = (
+                f"merged:{rep['merged']} demoted:{rep['headings_demoted']} "
+                f"cols:{len(rep['column_order_fixed_pages'])} "
+                f"wm:{rep['watermarks_removed']} fn:{rep['footnotes_detected']}"
             )
+            pages = data["page_count"]
+            secs = data["extraction_seconds"] + data["refine_seconds"]
+            rows.append(
+                (pdf.name, pages, secs, secs / pages if pages else 0.0,
+                 len(data["blocks"]), len(data["dropped"]), rep_str, "")
+            )
+            print(f"  {pdf.name}: done ({secs:.1f}s)", flush=True)
         except Exception as exc:
             exit_code = 2
             err_path.write_text(f"{exc}\n\n{traceback.format_exc()}")
+            rows.append((pdf.name, 0, 0.0, 0.0, 0, 0, "-", str(exc)[:50]))
             print(f"  {pdf.name}: ERROR {exc}", file=sys.stderr, flush=True)
+    print_summary(rows)
     return exit_code
 
 
